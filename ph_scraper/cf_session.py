@@ -150,6 +150,44 @@ def solve_cloudflare(target_url: str, max_timeout: int = 120_000) -> dict | None
     return None
 
 
+def _find_browser_on_windows() -> str | None:
+    """在 Windows 上通过注册表和常见路径查找 Chrome / Edge。"""
+    if sys.platform != "win32":
+        return None
+    # 1) 注册表
+    try:
+        import winreg
+        for key_path in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+        ):
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                try:
+                    with winreg.OpenKey(root, key_path) as key:
+                        val = winreg.QueryValue(key, None)
+                        if val and os.path.isfile(val):
+                            return val
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    # 2) 常见路径
+    for tmpl in (
+        r"{PROGRAMFILES}\Google\Chrome\Application\chrome.exe",
+        r"{PROGRAMFILES(X86)}\Google\Chrome\Application\chrome.exe",
+        r"{LOCALAPPDATA}\Google\Chrome\Application\chrome.exe",
+        r"{PROGRAMFILES}\Microsoft\Edge\Application\msedge.exe",
+        r"{PROGRAMFILES(X86)}\Microsoft\Edge\Application\msedge.exe",
+    ):
+        try:
+            p = os.path.expandvars(tmpl.replace("{", "%").replace("}", "%"))
+            if os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return None
+
+
 def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
                       progress_cb=None) -> dict | None:
     """使用本地 Chrome/Edge 自动过 Cloudflare（无需 Docker / 手动配置）。
@@ -172,8 +210,15 @@ def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
         co = ChromiumOptions()
         co.set_user_data_path(tempfile.mkdtemp(prefix="ph_cf_"))
         co.auto_port()
-        if os.environ.get("PH_BROWSER_PATH"):
-            co.set_browser_path(os.environ["PH_BROWSER_PATH"])
+
+        # 优先使用环境变量指定的浏览器路径，其次自动检测
+        browser_path = os.environ.get("PH_BROWSER_PATH") or _find_browser_on_windows()
+        if browser_path:
+            co.set_browser_path(browser_path)
+            _cb(f"找到浏览器: {browser_path}")
+        else:
+            _cb("使用 DrissionPage 默认浏览器检测...")
+
         co.set_argument('--no-first-run')
         co.set_argument('--no-default-browser-check')
         co.set_argument('--disable-popup-blocking')
