@@ -205,27 +205,63 @@ def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
         return None
 
     page = None
+    proc = None
     try:
+        import socket
         import tempfile
-        co = ChromiumOptions()
-        co.set_user_data_path(tempfile.mkdtemp(prefix="ph_cf_"))
-        co.auto_port()
 
-        # 优先使用环境变量指定的浏览器路径，其次自动检测
+        # 自己启动浏览器再让 DrissionPage 接管，
+        # 避免 PyInstaller 窗口程序中 DrissionPage 自带启动逻辑失败的问题
         browser_path = os.environ.get("PH_BROWSER_PATH") or _find_browser_on_windows()
-        if browser_path:
-            co.set_browser_path(browser_path)
-            _cb(f"找到浏览器: {browser_path}")
-        else:
-            _cb("使用 DrissionPage 默认浏览器检测...")
+        if not browser_path:
+            _cb("未找到 Chrome/Edge 浏览器，跳过自动浏览器验证")
+            log.warning("未找到 Chrome/Edge，无法自动浏览器验证")
+            return None
+        _cb(f"找到浏览器: {browser_path}")
 
-        co.set_argument('--no-first-run')
-        co.set_argument('--no-default-browser-check')
-        co.set_argument('--disable-popup-blocking')
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        user_data_dir = tempfile.mkdtemp(prefix="ph_cf_")
+
+        args = [
+            browser_path,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={user_data_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-popup-blocking",
+            "--window-size=1280,860",
+            "about:blank",
+        ]
         if sys.platform != "win32":
-            co.set_argument('--no-sandbox')
+            args.insert(1, "--no-sandbox")
+
         _cb("正在启动浏览器...")
-        page = ChromiumPage(addr_or_opts=co)
+        popen_kw: dict = dict(stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+        if sys.platform == "win32":
+            popen_kw["creationflags"] = 0x08000000  # CREATE_NO_WINDOW (仅控制台)
+        proc = subprocess.Popen(args, **popen_kw)
+
+        # 等待调试端口就绪
+        import urllib.request
+        ready = False
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/json/version", timeout=2):
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.5)
+        if not ready:
+            _cb("浏览器启动失败（调试端口未就绪）")
+            log.error("浏览器调试端口 %s 未就绪", port)
+            return None
+
+        page = ChromiumPage(addr_or_opts=f"127.0.0.1:{port}")
         page.get(target_url)
         _cb("浏览器已打开，等待 Cloudflare 验证通过（请勿手动关闭浏览器）...")
 
@@ -288,9 +324,6 @@ def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
         except Exception:
             pass
 
-        page.quit()
-        page = None
-
         if "cf_clearance" in cookies:
             _cb("浏览器自动验证成功！")
             log.info("浏览器自动验证成功，获取到 cf_clearance")
@@ -311,6 +344,15 @@ def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
                 page.quit()
             except Exception:
                 pass
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 class CFSession:
