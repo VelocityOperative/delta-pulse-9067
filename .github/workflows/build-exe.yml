@@ -1,0 +1,32 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt pyinstaller
+      - name: Build GUI exe
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name ProductHuntScraper `
+            --collect-all DrissionPage `
+            --icon app.ico --version-file version_info.txt gui.py
+      - name: Build CLI exe
+        run: |
+          pyinstaller --noconfirm --onefile --console --name ph-scraper-cli `
+            --collect-all DrissionPage `
+            --icon app.ico --version-file version_info.txt cli.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ProductHuntScraper-windows
+          path: dist/*.exe

@@ -1,0 +1,4 @@
+{
+  "cookie": "把浏览器里复制的完整 Cookie 串粘到这里（必须包含 cf_clearance=...），然后把本文件改名为 ph_cookies.json",
+  "user_agent": "把浏览器的 User-Agent 粘到这里，例如 Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+}
