@@ -20,11 +20,13 @@ jobs:
         run: |
           pyinstaller --noconfirm --onefile --windowed --name ProductHuntScraper `
             --collect-all DrissionPage `
+            --collect-all tzdata `
             --icon app.ico --version-file version_info.txt gui.py
       - name: Build CLI exe
         run: |
           pyinstaller --noconfirm --onefile --console --name ph-scraper-cli `
             --collect-all DrissionPage `
+            --collect-all tzdata `
             --icon app.ico --version-file version_info.txt cli.py
       - uses: actions/upload-artifact@v4
         with:

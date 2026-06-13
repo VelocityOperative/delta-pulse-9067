@@ -18,14 +18,14 @@ from datetime import date
 
 from ph_scraper.export import default_filename, export_any
 from ph_scraper.rate_limit import RateLimiter
-from ph_scraper.scraper import Cancelled, PHLeaderboardScraper, iso_week
+from ph_scraper.scraper import Cancelled, PHLeaderboardScraper, iso_week, ph_today
 from ph_scraper.store import Store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def parse_target(period: str, target: str):
-    today = date.today()
+    today = ph_today()  # ProductHunt 以美国太平洋时间换日
     if period == "daily":
         if target in ("today", "now"):
             d = today

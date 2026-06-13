@@ -189,7 +189,7 @@ def _find_browser_on_windows() -> str | None:
 
 
 def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
-                      progress_cb=None) -> dict | None:
+                      progress_cb=None, browser_path: str = "") -> dict | None:
     """使用本地 Chrome/Edge 自动过 Cloudflare（无需 Docker / 手动配置）。
 
     自动启动系统已安装的浏览器，导航到目标页面，等待 Cloudflare 挑战完成，
@@ -212,7 +212,8 @@ def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
 
         # 自己启动浏览器再让 DrissionPage 接管，
         # 避免 PyInstaller 窗口程序中 DrissionPage 自带启动逻辑失败的问题
-        browser_path = os.environ.get("PH_BROWSER_PATH") or _find_browser_on_windows()
+        browser_path = (browser_path or os.environ.get("PH_BROWSER_PATH")
+                        or _find_browser_on_windows())
         if not browser_path:
             _cb("未找到 Chrome/Edge 浏览器，跳过自动浏览器验证")
             log.warning("未找到 Chrome/Edge，无法自动浏览器验证")
@@ -358,8 +359,12 @@ def solve_via_browser(target_url: str = PH_BASE, timeout: int = 120,
 class CFSession:
     """带 Cloudflare cookies 的 HTTP Session，使用 curl_cffi TLS 指纹模拟。"""
 
-    def __init__(self, cookies: dict | None = None, user_agent: str = ""):
+    def __init__(self, cookies: dict | None = None, user_agent: str = "",
+                 timeout: int = 30, proxy: str = ""):
         self.session = creq.Session(impersonate="chrome131")
+        self.timeout = timeout if timeout and timeout > 0 else 30
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
         self.cookies = dict(cookies or {})
         if cookies:
             self.session.cookies.update(cookies)
@@ -371,16 +376,18 @@ class CFSession:
         self.user_agent = self._ua
 
     @classmethod
-    def from_flaresolverr(cls, target_url: str = PH_BASE) -> "CFSession | None":
+    def from_flaresolverr(cls, target_url: str = PH_BASE,
+                          timeout: int = 30, proxy: str = "") -> "CFSession | None":
         sol = solve_cloudflare(target_url)
         if sol:
-            return cls(cookies=sol["cookies"], user_agent=sol["user_agent"])
+            return cls(cookies=sol["cookies"], user_agent=sol["user_agent"],
+                       timeout=timeout, proxy=proxy)
         return None
 
     def get(self, url: str, **kw):
-        kw.setdefault("timeout", 30)
+        kw.setdefault("timeout", self.timeout)
         return self.session.get(url, **kw)
 
     def post(self, url: str, **kw):
-        kw.setdefault("timeout", 30)
+        kw.setdefault("timeout", self.timeout)
         return self.session.post(url, **kw)

@@ -22,7 +22,7 @@ import tkinter as tk
 from ph_scraper.export import default_filename, export_any
 from ph_scraper.paths import config_file
 from ph_scraper.rate_limit import RateLimiter
-from ph_scraper.scraper import Cancelled, PHLeaderboardScraper, iso_week
+from ph_scraper.scraper import Cancelled, PHLeaderboardScraper, iso_week, ph_today
 from ph_scraper.store import Store
 
 logging.basicConfig(level=logging.INFO)
@@ -72,13 +72,35 @@ class App(tk.Tk):
         except Exception:
             return {}
 
+    # 设置项默认值
+    _DEFAULTS = {
+        "interval": 0.3,
+        "workers": 8,
+        "export_dir": "",
+        "browser_path": "",
+        "enable_browser": True,
+        "request_timeout": 30,
+        "browser_timeout": 120,
+        "proxy": "",
+        "auto_export": True,
+        "auto_fallback": True,
+    }
+
+    def _cfg_get(self, key):
+        val = self._cfg.get(key)
+        return self._DEFAULTS.get(key) if val is None else val
+
     def _save_cfg(self):
         try:
-            config_file().write_text(json.dumps({
-                "interval": self.interval.get(),
-                "workers": self.workers.get(),
-                "export_dir": self._cfg.get("export_dir", ""),
-            }), encoding="utf-8")
+            data = {k: self._cfg_get(k) for k in self._DEFAULTS}
+            try:
+                data["interval"] = self.interval.get()
+                data["workers"] = self.workers.get()
+            except Exception:
+                pass
+            self._cfg.update(data)
+            config_file().write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
 
@@ -101,7 +123,7 @@ class App(tk.Tk):
             ttk.Radiobutton(top, text=lbl, value=val, variable=self.period,
                             command=self._on_period).grid(row=0, column=i, padx=6)
 
-        today = date.today()
+        today = ph_today()
         self.sel_year = tk.IntVar(value=today.year)
         self.sel_month = tk.IntVar(value=today.month)
         self.sel_day = tk.IntVar(value=today.day)
@@ -141,6 +163,8 @@ class App(tk.Tk):
         self.cancel_btn.pack(side="left", padx=8)
         self.export_btn = ttk.Button(btns, text="导出...", command=self._export, state="disabled")
         self.export_btn.pack(side="left", padx=8)
+        self.settings_btn = ttk.Button(btns, text="设置", command=self._open_settings)
+        self.settings_btn.pack(side="left", padx=8)
         self.status = ttk.Label(btns, text="就绪")
         self.status.pack(side="left", padx=12)
 
@@ -177,7 +201,7 @@ class App(tk.Tk):
         for w in self.date_frame.winfo_children():
             w.destroy()
         p = self.period.get()
-        years = list(range(date.today().year, 2012, -1))
+        years = list(range(ph_today().year, 2012, -1))
 
         def combo(var, values, width=6):
             cb = ttk.Combobox(self.date_frame, values=values, width=width,
@@ -212,7 +236,7 @@ class App(tk.Tk):
             self.week_hint.config(text="")
 
     def _quick(self, period):
-        today = date.today()
+        today = ph_today()
         self.period.set(period)
         self.sel_year.set(today.year)
         self.sel_month.set(today.month)
@@ -280,7 +304,7 @@ class App(tk.Tk):
                     st.close()
                 except Exception as e:
                     self._log(f"写入产品库失败: {e}")
-            if not cancelled:
+            if not cancelled and self._cfg_get("auto_export"):
                 self._export()
 
     def _fill_tree(self, products):
@@ -334,6 +358,12 @@ class App(tk.Tk):
         period = self.period.get()
         interval = self.interval.get()
         workers = self.workers.get()
+        enable_browser = bool(self._cfg_get("enable_browser"))
+        browser_path = str(self._cfg_get("browser_path") or "")
+        request_timeout = int(self._cfg_get("request_timeout") or 30)
+        browser_timeout = int(self._cfg_get("browser_timeout") or 120)
+        proxy = str(self._cfg_get("proxy") or "")
+        auto_fallback = bool(self._cfg_get("auto_fallback"))
         self._cancel = threading.Event()
         self.start_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
@@ -353,9 +383,32 @@ class App(tk.Tk):
                     phase_cb=lambda ph, c, t: self._q.put(("phase", (ph, c, t))),
                     resolve_workers=workers,
                     cancel_event=cancel,
+                    enable_browser_cf=enable_browser,
+                    browser_path=browser_path,
+                    browser_timeout=browser_timeout,
+                    request_timeout=request_timeout,
+                    proxy=proxy,
                 )
                 products = scraper.fetch_all(
                     period, checkpoint_key=f"{period}_{label}", **kwargs)
+                # 日榜抓到 0 条且开启了自动回退：改抓太平洋时间前一天
+                if (not products and period == "daily" and auto_fallback
+                        and not cancel.is_set() and "day" in kwargs):
+                    try:
+                        prev = date(kwargs["year"], kwargs["month"],
+                                    kwargs["day"]) - timedelta(days=1)
+                        self._q.put(("log",
+                            f"今天(太平洋时间)榜单暂无数据，自动改抓前一天 "
+                            f"{prev.year}-{prev.month:02d}-{prev.day:02d} ..."))
+                        self._q.put(("log",
+                            "=== 自动回退抓取 daily "
+                            f"{prev.year}-{prev.month:02d}-{prev.day:02d} ==="))
+                        fb_label = f"{prev.year}-{prev.month:02d}-{prev.day:02d}"
+                        products = scraper.fetch_all(
+                            period, checkpoint_key=f"{period}_{fb_label}",
+                            year=prev.year, month=prev.month, day=prev.day)
+                    except Exception as fe:
+                        self._q.put(("log", f"自动回退失败: {fe}"))
                 self._q.put(("done", (products, False)))
             except Cancelled as c:
                 self._q.put(("done", (c.products, True)))
@@ -390,6 +443,11 @@ class App(tk.Tk):
         self._save_cfg()
         self._log(f"已导出: {fn}")
         self.status.config(text=f"已导出 {len(self._products)} 条 -> {fn}")
+
+    # ---------- 设置 ----------
+
+    def _open_settings(self):
+        SettingsDialog(self)
 
     # ---------- Cookie 向导 ----------
 
@@ -443,6 +501,120 @@ class CookieWizard(tk.Toplevel):
                                      ensure_ascii=False, indent=1), encoding="utf-8")
         messagebox.showinfo("已保存", f"已写入 {target}\n请重新点击「开始抓取」。",
                             parent=self)
+        self.destroy()
+
+
+class SettingsDialog(tk.Toplevel):
+    """常规设置面板：浏览器路径、超时、代理、自动验证开关、导出/回退等。"""
+
+    def __init__(self, master: "App"):
+        super().__init__(master)
+        self.app = master
+        self.title("设置")
+        self.geometry("620x460")
+        self.grab_set()
+        self.resizable(False, False)
+        g = master._cfg_get
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        # --- 浏览器自动验证 ---
+        bf = ttk.LabelFrame(frm, text="Cloudflare 自动浏览器验证", padding=10)
+        bf.pack(fill="x")
+        self.enable_browser = tk.BooleanVar(value=bool(g("enable_browser")))
+        ttk.Checkbutton(bf, text="启用自动浏览器验证（直连失败时自动启动 Chrome/Edge 过验证）",
+                        variable=self.enable_browser).grid(
+            row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(bf, text="浏览器路径(留空自动查找):").grid(
+            row=1, column=0, sticky="w", pady=(8, 0))
+        self.browser_path = tk.StringVar(value=str(g("browser_path") or ""))
+        ttk.Entry(bf, textvariable=self.browser_path, width=46).grid(
+            row=1, column=1, pady=(8, 0))
+        ttk.Button(bf, text="浏览...", command=self._pick_browser).grid(
+            row=1, column=2, padx=(6, 0), pady=(8, 0))
+        ttk.Label(bf, text="浏览器验证超时(秒):").grid(
+            row=2, column=0, sticky="w", pady=(8, 0))
+        self.browser_timeout = tk.IntVar(value=int(g("browser_timeout") or 120))
+        ttk.Spinbox(bf, from_=30, to=600, increment=10,
+                    textvariable=self.browser_timeout, width=8).grid(
+            row=2, column=1, sticky="w", pady=(8, 0))
+
+        # --- 网络 ---
+        nf = ttk.LabelFrame(frm, text="网络", padding=10)
+        nf.pack(fill="x", pady=(10, 0))
+        ttk.Label(nf, text="请求超时(秒):").grid(row=0, column=0, sticky="w")
+        self.request_timeout = tk.IntVar(value=int(g("request_timeout") or 30))
+        ttk.Spinbox(nf, from_=5, to=300, increment=5,
+                    textvariable=self.request_timeout, width=8).grid(
+            row=0, column=1, sticky="w")
+        ttk.Label(nf, text="代理(可选, 如 http://127.0.0.1:7890):").grid(
+            row=1, column=0, sticky="w", pady=(8, 0))
+        self.proxy = tk.StringVar(value=str(g("proxy") or ""))
+        ttk.Entry(nf, textvariable=self.proxy, width=40).grid(
+            row=1, column=1, sticky="w", pady=(8, 0))
+
+        # --- 输出与行为 ---
+        of = ttk.LabelFrame(frm, text="输出与行为", padding=10)
+        of.pack(fill="x", pady=(10, 0))
+        ttk.Label(of, text="默认导出目录:").grid(row=0, column=0, sticky="w")
+        self.export_dir = tk.StringVar(value=str(g("export_dir") or ""))
+        ttk.Entry(of, textvariable=self.export_dir, width=40).grid(
+            row=0, column=1, sticky="w")
+        ttk.Button(of, text="浏览...", command=self._pick_dir).grid(
+            row=0, column=2, padx=(6, 0))
+        self.auto_export = tk.BooleanVar(value=bool(g("auto_export")))
+        ttk.Checkbutton(of, text="抓取完成后自动弹出导出窗口",
+                        variable=self.auto_export).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.auto_fallback = tk.BooleanVar(value=bool(g("auto_fallback")))
+        ttk.Checkbutton(
+            of, text="日榜「今天」无数据时自动改抓前一天（太平洋时间换日）",
+            variable=self.auto_fallback).grid(
+            row=2, column=0, columnspan=3, sticky="w")
+
+        bbar = ttk.Frame(frm)
+        bbar.pack(fill="x", pady=(14, 0))
+        ttk.Button(bbar, text="保存", command=self._save).pack(side="right")
+        ttk.Button(bbar, text="取消", command=self.destroy).pack(
+            side="right", padx=8)
+        ttk.Button(bbar, text="恢复默认", command=self._reset).pack(side="left")
+
+    def _pick_browser(self):
+        fn = filedialog.askopenfilename(
+            parent=self, title="选择 Chrome / Edge 可执行文件",
+            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+        if fn:
+            self.browser_path.set(fn)
+
+    def _pick_dir(self):
+        d = filedialog.askdirectory(parent=self, title="选择默认导出目录")
+        if d:
+            self.export_dir.set(d)
+
+    def _reset(self):
+        d = self.app._DEFAULTS
+        self.enable_browser.set(bool(d["enable_browser"]))
+        self.browser_path.set(d["browser_path"])
+        self.browser_timeout.set(int(d["browser_timeout"]))
+        self.request_timeout.set(int(d["request_timeout"]))
+        self.proxy.set(d["proxy"])
+        self.export_dir.set(d["export_dir"])
+        self.auto_export.set(bool(d["auto_export"]))
+        self.auto_fallback.set(bool(d["auto_fallback"]))
+
+    def _save(self):
+        cfg = self.app._cfg
+        cfg["enable_browser"] = bool(self.enable_browser.get())
+        cfg["browser_path"] = self.browser_path.get().strip()
+        cfg["browser_timeout"] = int(self.browser_timeout.get())
+        cfg["request_timeout"] = int(self.request_timeout.get())
+        cfg["proxy"] = self.proxy.get().strip()
+        cfg["export_dir"] = self.export_dir.get().strip()
+        cfg["auto_export"] = bool(self.auto_export.get())
+        cfg["auto_fallback"] = bool(self.auto_fallback.get())
+        self.app._save_cfg()
+        self.app._log("设置已保存")
         self.destroy()
 
 

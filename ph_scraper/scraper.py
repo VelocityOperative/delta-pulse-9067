@@ -13,7 +13,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 from . import queries
 from .cf_session import (CFSession, PH_BASE, clear_cached_session,
@@ -75,17 +75,61 @@ def iso_week(d: date) -> int:
     return d.isocalendar()[1]
 
 
+def _us_pacific_is_dst(d: date) -> bool:
+    """美国夏令时区间：3 月第二个周日 ~ 11 月第一个周日。"""
+    def nth_sunday(year: int, month: int, n: int) -> date:
+        first = date(year, month, 1)
+        first_sunday = 1 + (6 - first.weekday()) % 7
+        return date(year, month, first_sunday + (n - 1) * 7)
+    if d.month < 3 or d.month > 11:
+        return False
+    if 3 < d.month < 11:
+        return True
+    if d.month == 3:
+        return d >= nth_sunday(d.year, 3, 2)
+    return d < nth_sunday(d.year, 11, 1)  # 11 月
+
+
+def pacific_now() -> datetime:
+    """返回 ProductHunt 基准的美国太平洋时间当前时刻。
+
+    ProductHunt 排行榜按太平洋时间每天 0 点重置，所以"今天/本周/本月"
+    必须以太平洋时间为准，否则在中国(UTC+8)上午点"抓取今天"会查到
+    一个在太平洋时间还没开始的日期，导致排行榜为空、抓取 0 条。
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles"))
+    except Exception:
+        # 退化方案：手动估算（zoneinfo / tzdata 不可用时）
+        utc = datetime.now(timezone.utc)
+        off = -7 if _us_pacific_is_dst(utc.date()) else -8
+        return utc + timedelta(hours=off)
+
+
+def ph_today() -> date:
+    """ProductHunt 排行榜意义上的"今天"（太平洋时间）。"""
+    return pacific_now().date()
+
+
 class PHLeaderboardScraper:
     def __init__(self, rate_limiter: RateLimiter | None = None,
                  proxy_pool: ProxyPool | None = None,
                  progress_cb=None, resolve_workers: int = 8,
                  cancel_event: threading.Event | None = None,
-                 phase_cb=None):
+                 phase_cb=None, *, enable_browser_cf: bool = True,
+                 browser_path: str = "", browser_timeout: int = 120,
+                 request_timeout: int = 30, proxy: str = ""):
         """
         progress_cb(msg): 文本日志回调。
         phase_cb(phase, current, total): 结构化进度回调
             phase: "session" / "pages" / "resolve"; total 可能为 0（未知）。
         cancel_event: 置位后任务尽快停止，fetch_all 抛出 Cancelled（含已抓数据）。
+        enable_browser_cf: 是否启用自动浏览器过 Cloudflare（设置项）。
+        browser_path: 指定 Chrome/Edge 路径（设置项，留空自动查找）。
+        browser_timeout: 浏览器自动验证最长等待秒数。
+        request_timeout: 单次 HTTP 请求超时秒数。
+        proxy: 代理地址，如 http://127.0.0.1:7890（留空不使用）。
         """
         self.rl = rate_limiter or RateLimiter(min_interval=0.3, jitter=0.4)
         # 重定向解析独立限流通道，避免与翻页互相排队
@@ -99,6 +143,16 @@ class PHLeaderboardScraper:
         self.cancel_event = cancel_event or threading.Event()
         self._session_lock = threading.Lock()
         self.stats = {"requests": 0, "http_429": 0, "pages": 0}
+        self.enable_browser_cf = enable_browser_cf
+        self.browser_path = browser_path
+        self.browser_timeout = browser_timeout
+        self.request_timeout = request_timeout
+        self.proxy = proxy
+
+    def _new_session(self, cookies: dict | None = None,
+                     user_agent: str = "") -> CFSession:
+        return CFSession(cookies=cookies, user_agent=user_agent,
+                         timeout=self.request_timeout, proxy=self.proxy)
 
     def _check_cancel(self, products):
         if self.cancel_event.is_set():
@@ -119,7 +173,7 @@ class PHLeaderboardScraper:
         manual = load_manual_cookies()
         if manual:
             self.progress_cb("使用手动 Cookie（ph_cookies.json）...")
-            s = CFSession(cookies=manual["cookies"], user_agent=manual["user_agent"])
+            s = self._new_session(cookies=manual["cookies"], user_agent=manual["user_agent"])
             if ok(s):
                 self.session = s
                 self.progress_cb("Cloudflare 会话建立成功（手动 Cookie）")
@@ -129,7 +183,7 @@ class PHLeaderboardScraper:
         # 2) 上次成功的会话缓存（24h 内有效则免重新验证）
         cached = load_cached_session()
         if cached:
-            s = CFSession(cookies=cached["cookies"], user_agent=cached["user_agent"])
+            s = self._new_session(cookies=cached["cookies"], user_agent=cached["user_agent"])
             if ok(s):
                 self.session = s
                 self.progress_cb("Cloudflare 会话建立成功（复用缓存会话）")
@@ -138,7 +192,7 @@ class PHLeaderboardScraper:
             clear_cached_session()
         # 3) 直接裸连：住宅/家用 IP 下 TLS 指纹模拟通常可直接通过
         self.progress_cb("尝试直接 TLS 指纹连接...")
-        s = CFSession()
+        s = self._new_session()
         if ok(s):
             self.session = s
             save_cached_session(s.cookies, s.user_agent)
@@ -146,21 +200,27 @@ class PHLeaderboardScraper:
             self.phase_cb("session", 1, 1)
             return
         # 4) 自动浏览器（DrissionPage：自动启动 Chrome/Edge 过验证，无需 Docker）
-        self.progress_cb("直连被拦截，尝试启动浏览器自动验证...")
-        browser_sol = solve_via_browser(ref_url, progress_cb=self.progress_cb)
-        if browser_sol:
-            s = CFSession(cookies=browser_sol["cookies"],
-                          user_agent=browser_sol["user_agent"])
-            if ok(s):
-                self.session = s
-                save_cached_session(s.cookies, s.user_agent)
-                self.progress_cb("Cloudflare 会话建立成功（自动浏览器验证）")
-                self.phase_cb("session", 1, 1)
-                return
-            self.progress_cb("浏览器获取的 Cookie 验证失败，尝试 FlareSolverr...")
+        if self.enable_browser_cf:
+            self.progress_cb("直连被拦截，尝试启动浏览器自动验证...")
+            browser_sol = solve_via_browser(ref_url, timeout=self.browser_timeout,
+                                            progress_cb=self.progress_cb,
+                                            browser_path=self.browser_path)
+            if browser_sol:
+                s = self._new_session(cookies=browser_sol["cookies"],
+                                      user_agent=browser_sol["user_agent"])
+                if ok(s):
+                    self.session = s
+                    save_cached_session(s.cookies, s.user_agent)
+                    self.progress_cb("Cloudflare 会话建立成功（自动浏览器验证）")
+                    self.phase_cb("session", 1, 1)
+                    return
+                self.progress_cb("浏览器获取的 Cookie 验证失败，尝试 FlareSolverr...")
+        else:
+            self.progress_cb("自动浏览器验证已在设置中关闭，跳过")
         # 5) FlareSolverr（需要 Docker）
         self.progress_cb("尝试 FlareSolverr 过 Cloudflare 验证...")
-        self.session = CFSession.from_flaresolverr(ref_url)
+        self.session = CFSession.from_flaresolverr(
+            ref_url, timeout=self.request_timeout, proxy=self.proxy)
         if self.session is None:
             raise RuntimeError(
                 "无法通过 Cloudflare 验证。所有方式均失败：\n"
@@ -212,12 +272,20 @@ class PHLeaderboardScraper:
                 cursor=cursor, featured=include_featured_only)
             payload = queries.build_payload(period, variables)
             data = self._graphql(payload, ref, products)
+            errs = data.get("errors")
             hf = (data.get("data") or {}).get("homefeedItems")
             if not hf:
+                if errs:
+                    self.progress_cb(f"GraphQL 返回错误（接口可能已变动）: {str(errs)[:200]}")
+                elif page == 1:
+                    self.progress_cb(
+                        "该日期排行榜暂无数据。注意：ProductHunt 按【美国太平洋时间】"
+                        "每天 0 点更新，今天(太平洋时间)可能尚未开始，可改抓前一天。")
                 log.warning("homefeedItems 为空: %s", str(data)[:300])
                 break
             edges = hf.get("edges", [])
             new = 0
+            skipped_ad = 0
             for e in edges:
                 node = e.get("node") or {}
                 if node.get("__typename") not in (None, "Post"):
@@ -227,6 +295,7 @@ class PHLeaderboardScraper:
                     continue
                 # 跳过推广位（广告）：广告节点没有 /r/p/ 跳转链接
                 if not node.get("shortenedUrl"):
+                    skipped_ad += 1
                     continue
                 seen_ids.add(pid)
                 products.append(self._node_to_product(node))
@@ -235,6 +304,11 @@ class PHLeaderboardScraper:
             cursor = pi.get("endCursor")
             self.stats["pages"] = page
             self.progress_cb(f"第 {page} 页: +{new} 条 (累计 {len(products)})")
+            # 第一页拿到原始条目却 0 新增时，说明问题出在过滤/去重而非空榜，给出诊断
+            if page == 1 and new == 0 and edges:
+                self.progress_cb(
+                    f"诊断：本页返回 {len(edges)} 个原始条目，但因广告过滤({skipped_ad})/"
+                    f"去重后新增 0 条。若持续如此请把日志发我。")
             self.phase_cb("pages", len(products), 0)
             if checkpoint_key and page % CHECKPOINT_EVERY_PAGES == 0:
                 store.save_checkpoint(checkpoint_key, cursor, products)
